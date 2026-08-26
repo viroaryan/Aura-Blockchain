@@ -1,5 +1,5 @@
 {
-  "buildCommand": "cd explorer && npm install && npm run build",
-  "outputDirectory": "explorer/.next",
-  "framework": "nextjs"
+  "framework": "nextjs",
+  "buildCommand": "npm --prefix explorer run build",
+  "outputDirectory": "explorer/.next"
 }
