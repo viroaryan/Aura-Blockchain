@@ -228,11 +228,21 @@ export default function MeshDvpnPage() {
         </div>
 
         {/* Action Controls */}
-        <div className="flex items-center gap-2 w-full sm:w-auto">
+        <div className="flex items-center gap-2 w-full sm:w-auto flex-wrap">
+          <a
+            href="/aura-mesh.apk"
+            download="aura-mesh.apk"
+            className="flex items-center justify-center gap-1.5 rounded-xl bg-indigo-50 border border-indigo-200 px-3.5 py-2.5 text-xs font-bold text-indigo-700 hover:bg-indigo-100 shadow-xs transition-all cursor-pointer"
+            title="Download native Android APK to route 100% OS traffic"
+          >
+            <Smartphone className="h-4 w-4 text-indigo-600" />
+            <span>Download APK</span>
+          </a>
+
           {isConnected ? (
             <button
               onClick={handleDisconnect}
-              className="w-full sm:w-auto flex items-center justify-center gap-1.5 rounded-xl bg-red-50 border border-red-200 px-4 py-2.5 text-xs font-bold text-red-700 hover:bg-red-100 shadow-xs transition-all cursor-pointer"
+              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 rounded-xl bg-red-50 border border-red-200 px-4 py-2.5 text-xs font-bold text-red-700 hover:bg-red-100 shadow-xs transition-all cursor-pointer"
             >
               <Power className="h-4 w-4" />
               <span>Disconnect Peer</span>
@@ -240,7 +250,7 @@ export default function MeshDvpnPage() {
           ) : (
             <button
               onClick={() => setActiveTab('pair')}
-              className="w-full sm:w-auto flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-emerald-700 transition-all cursor-pointer"
+              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-emerald-700 transition-all cursor-pointer"
             >
               <Power className="h-4 w-4" />
               <span>Connect Devices</span>
@@ -691,11 +701,23 @@ export default function MeshDvpnPage() {
               </p>
             </div>
 
-            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-2">
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3">
               <span className="font-bold text-slate-900 block text-sm">To route 100% of your phone's background internet:</span>
-              <ol className="list-decimal pl-4 space-y-1.5 text-slate-600">
+              <ol className="list-decimal pl-4 space-y-2 text-slate-600">
                 <li>
-                  <strong>Android APK (Native VpnService):</strong> Run the native Android companion app (`AuraVpnService.kt`) which creates a virtual network interface (<code className="bg-white px-1 py-0.5 rounded border border-slate-200 font-mono text-emerald-700 font-bold">tun0</code>) and routes <code className="bg-white px-1 py-0.5 rounded border border-slate-200 font-mono text-emerald-700 font-bold">0.0.0.0/0</code> through your friend's 5G node.
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+                    <div>
+                      <strong>Android APK (Native VpnService):</strong> Run the native Android companion app (`AuraVpnService.kt`) which creates a virtual network interface (<code className="bg-white px-1 py-0.5 rounded border border-slate-200 font-mono text-emerald-700 font-bold">tun0</code>) and routes <code className="bg-white px-1 py-0.5 rounded border border-slate-200 font-mono text-emerald-700 font-bold">0.0.0.0/0</code> through your friend's 5G node.
+                    </div>
+                    <a
+                      href="/aura-mesh.apk"
+                      download="aura-mesh.apk"
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-emerald-700 transition-all shrink-0 cursor-pointer"
+                    >
+                      <Download className="h-4 w-4" />
+                      <span>Download Android APK (18.9 MB)</span>
+                    </a>
+                  </div>
                 </li>
                 <li>
                   <strong>Laptop / PC SOCKS5 Proxy:</strong> Set your system proxy or Chrome proxy extension to <code className="bg-white px-1 py-0.5 rounded border border-slate-200 font-mono text-emerald-700 font-bold">SOCKS5 127.0.0.1:1080</code> (served by `aura-tunnel`).

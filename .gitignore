@@ -17,6 +17,11 @@ dist/
 *.wal
 *.db
 
+# Android
+android/.gradle/
+android/**/build/
+android/local.properties
+
 # OS & Editor
 .DS_Store
 Thumbs.db
