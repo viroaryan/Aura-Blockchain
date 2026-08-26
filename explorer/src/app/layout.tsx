@@ -15,8 +15,8 @@ const monoFont = JetBrains_Mono({
 })
 
 export const metadata = {
-  title: 'Aura Network | Proof-of-Stake Blockchain & Mesh dVPN',
-  description: 'Enterprise-grade blockchain explorer, decentralized web wallet, and encrypted remote hotspot sharing protocol.',
+  title: 'Aura Mesh | Free Global Communication, 4K Media Drop & Internet Relay',
+  description: '100% Free peer-to-peer messaging, direct binary 4K video & media sharing, and global encrypted hotspot internet relay with zero server storage.',
 }
 
 export default function RootLayout({
@@ -26,9 +26,9 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className={`${sansFont.variable} ${monoFont.variable}`}>
-      <body className="min-h-screen font-sans bg-[#f8fafc] text-slate-900 antialiased selection:bg-emerald-500/20 selection:text-emerald-900">
+      <body className="min-h-screen font-sans bg-[#f8fafd] text-slate-900 antialiased selection:bg-emerald-500/20 selection:text-emerald-900 pb-20 md:pb-8">
         <Navbar />
-        <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
+        <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
           {children}
         </main>
       </body>

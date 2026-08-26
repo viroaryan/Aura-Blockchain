@@ -1,17 +1,22 @@
 import type Peer from 'peerjs'
 import type { DataConnection } from 'peerjs'
 
+export type MediaType = 'text' | 'image' | 'video' | 'audio' | 'document'
+
 export interface PeerMessage {
   id: string
   sender: 'self' | 'peer'
   text?: string
   timestamp: number
-  type: 'chat' | 'file_meta' | 'file_chunk' | 'ping' | 'pong' | 'speed_chunk'
+  type: 'chat' | 'file_meta' | 'file_chunk' | 'ping' | 'pong' | 'speed_chunk' | 'voice_note'
+  mediaType?: MediaType
+  audioUrl?: string
   fileMeta?: {
     fileId: string
     fileName: string
     fileSize: number
     fileType: string
+    mediaType: MediaType
     chunksTotal: number
   }
 }
@@ -21,10 +26,12 @@ export interface FileTransferProgress {
   fileName: string
   fileSize: number
   fileType: string
+  mediaType: MediaType
   receivedBytes: number
   progressPercent: number
   isComplete: boolean
   downloadUrl?: string
+  previewUrl?: string
   sender: 'self' | 'peer'
 }
 
@@ -35,6 +42,22 @@ export interface LiveMeshDiagnostics {
   realSpeedMbps: number
   connectionState: 'disconnected' | 'connecting' | 'connected'
   remotePeerId?: string
+}
+
+export function detectMediaType(mimeType: string, filename: string): MediaType {
+  const lowerMime = mimeType.toLowerCase()
+  const lowerName = filename.toLowerCase()
+
+  if (lowerMime.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp|svg)$/i.test(lowerName)) {
+    return 'image'
+  }
+  if (lowerMime.startsWith('video/') || /\.(mp4|webm|mkv|mov|avi)$/i.test(lowerName)) {
+    return 'video'
+  }
+  if (lowerMime.startsWith('audio/') || /\.(mp3|wav|ogg|m4a|aac|webm)$/i.test(lowerName)) {
+    return 'audio'
+  }
+  return 'document'
 }
 
 export class RealAuraMeshEngine {
@@ -76,12 +99,11 @@ export class RealAuraMeshEngine {
   }
 
   /**
-   * Initialize local Peer instance with public STUN/TURN broker
+   * Initialize local Peer instance with Google STUN broker
    */
   public async init(custom6DigitCode?: string): Promise<string> {
     if (typeof window === 'undefined') return ''
 
-    // Dynamically import peerjs on client-side only
     const { default: PeerClass } = await import('peerjs')
 
     const randomSuffix = custom6DigitCode || Math.floor(100000 + Math.random() * 900000).toString()
@@ -115,7 +137,6 @@ export class RealAuraMeshEngine {
         peer.on('error', (err) => {
           console.warn('PeerJS event:', err.type)
           if (err.type === 'unavailable-id') {
-            // Generate fallback random ID
             const fallbackSuffix = Math.floor(100000 + Math.random() * 900000).toString()
             const fallbackPeer = new PeerClass(`aura-${fallbackSuffix}`)
             this.peer = fallbackPeer
@@ -208,13 +229,35 @@ export class RealAuraMeshEngine {
           text: data.text,
           timestamp: data.timestamp || Date.now(),
           type: 'chat',
+          mediaType: 'text',
         })
       }
       this.emitDiagnostics()
       return
     }
 
-    // 2. Keep-Alive Ping / Pong
+    // 2. Voice Note Message
+    if (data.type === 'voice_note') {
+      this.bytesReceived += data.audioData?.length || 0
+      const audioBlob = new Blob([new Uint8Array(data.audioData)], { type: data.mimeType || 'audio/webm' })
+      const audioUrl = URL.createObjectURL(audioBlob)
+
+      if (this.onMessageCb) {
+        this.onMessageCb({
+          id: data.id || Math.random().toString(36).substring(7),
+          sender: 'peer',
+          text: '🎤 Voice Message',
+          timestamp: data.timestamp || Date.now(),
+          type: 'voice_note',
+          mediaType: 'audio',
+          audioUrl,
+        })
+      }
+      this.emitDiagnostics()
+      return
+    }
+
+    // 3. Keep-Alive Ping / Pong
     if (data.type === 'ping') {
       this.connection?.send({ type: 'pong', timestamp: data.timestamp })
       return
@@ -225,7 +268,7 @@ export class RealAuraMeshEngine {
       return
     }
 
-    // 3. File Metadata Header
+    // 4. File Metadata Header
     if (data.type === 'file_meta') {
       const meta = data.fileMeta
       this.fileBuffers.set(meta.fileId, {
@@ -240,6 +283,7 @@ export class RealAuraMeshEngine {
           fileName: meta.fileName,
           fileSize: meta.fileSize,
           fileType: meta.fileType,
+          mediaType: meta.mediaType || detectMediaType(meta.fileType, meta.fileName),
           receivedBytes: 0,
           progressPercent: 0,
           isComplete: false,
@@ -249,7 +293,7 @@ export class RealAuraMeshEngine {
       return
     }
 
-    // 4. File Binary Chunk
+    // 5. File Binary Chunk
     if (data.type === 'file_chunk') {
       const { fileId, chunkIdx, chunkBytes } = data
       const entry = this.fileBuffers.get(fileId)
@@ -264,9 +308,13 @@ export class RealAuraMeshEngine {
       const isComplete = entry.received >= entry.meta.fileSize || entry.chunks.filter(Boolean).length >= entry.meta.chunksTotal
 
       let downloadUrl: string | undefined
+      let previewUrl: string | undefined
+
       if (isComplete) {
-        const blob = new Blob(entry.chunks as any, { type: entry.meta.fileType || 'application/octet-stream' })
+        const mime = entry.meta.fileType || 'application/octet-stream'
+        const blob = new Blob(entry.chunks as any, { type: mime })
         downloadUrl = URL.createObjectURL(blob)
+        previewUrl = downloadUrl
       }
 
       if (this.onFileProgressCb) {
@@ -275,10 +323,12 @@ export class RealAuraMeshEngine {
           fileName: entry.meta.fileName,
           fileSize: entry.meta.fileSize,
           fileType: entry.meta.fileType,
+          mediaType: entry.meta.mediaType || detectMediaType(entry.meta.fileType, entry.meta.fileName),
           receivedBytes: entry.received,
           progressPercent: percent,
           isComplete,
           downloadUrl,
+          previewUrl,
           sender: 'peer',
         })
       }
@@ -287,7 +337,7 @@ export class RealAuraMeshEngine {
       return
     }
 
-    // 5. Bandwidth Burst Chunk
+    // 6. Bandwidth Burst Chunk
     if (data.type === 'speed_chunk') {
       this.bytesReceived += data.size || 0
       this.emitDiagnostics()
@@ -317,13 +367,49 @@ export class RealAuraMeshEngine {
         text: msg.text,
         timestamp: msg.timestamp,
         type: 'chat',
+        mediaType: 'text',
       })
     }
     this.emitDiagnostics()
   }
 
   /**
-   * Send real file in 16KB binary chunks
+   * Send Voice Note
+   */
+  public async sendVoiceNote(audioBlob: Blob) {
+    if (!this.connection) return
+
+    const arrayBuffer = await audioBlob.arrayBuffer()
+    const audioData = Array.from(new Uint8Array(arrayBuffer))
+    const msgId = Math.random().toString(36).substring(7)
+    const audioUrl = URL.createObjectURL(audioBlob)
+
+    this.connection.send({
+      type: 'voice_note',
+      id: msgId,
+      mimeType: audioBlob.type,
+      audioData,
+      timestamp: Date.now(),
+    })
+
+    this.bytesSent += audioData.length
+
+    if (this.onMessageCb) {
+      this.onMessageCb({
+        id: msgId,
+        sender: 'self',
+        text: '🎤 Voice Message',
+        timestamp: Date.now(),
+        type: 'voice_note',
+        mediaType: 'audio',
+        audioUrl,
+      })
+    }
+    this.emitDiagnostics()
+  }
+
+  /**
+   * Send real file in 16KB binary chunks with rich media metadata
    */
   public async sendRealFile(file: File) {
     if (!this.connection) return
@@ -331,6 +417,8 @@ export class RealAuraMeshEngine {
     const CHUNK_SIZE = 16 * 1024 // 16 KB per WebRTC frame
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
     const fileId = Math.random().toString(36).substring(7)
+    const mediaType = detectMediaType(file.type, file.name)
+    const localPreviewUrl = URL.createObjectURL(file)
 
     // Send metadata
     this.connection.send({
@@ -340,6 +428,7 @@ export class RealAuraMeshEngine {
         fileName: file.name,
         fileSize: file.size,
         fileType: file.type || 'application/octet-stream',
+        mediaType,
         chunksTotal: totalChunks,
       },
     })
@@ -350,9 +439,12 @@ export class RealAuraMeshEngine {
         fileName: file.name,
         fileSize: file.size,
         fileType: file.type,
+        mediaType,
         receivedBytes: 0,
         progressPercent: 0,
         isComplete: false,
+        previewUrl: localPreviewUrl,
+        downloadUrl: localPreviewUrl,
         sender: 'self',
       })
     }
@@ -383,16 +475,19 @@ export class RealAuraMeshEngine {
           fileName: file.name,
           fileSize: file.size,
           fileType: file.type,
+          mediaType,
           receivedBytes: Math.min(offset, file.size),
           progressPercent: percent,
           isComplete: offset >= file.size,
+          previewUrl: localPreviewUrl,
+          downloadUrl: localPreviewUrl,
           sender: 'self',
         })
       }
 
       this.emitDiagnostics()
       // Small pause to prevent buffer overflow
-      await new Promise((r) => setTimeout(r, 8))
+      await new Promise((r) => setTimeout(r, 6))
     }
   }
 
@@ -404,14 +499,14 @@ export class RealAuraMeshEngine {
     const dummyChunk = new Array(8192).fill(0xaa) // 8KB
     const startTime = Date.now()
 
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 24; i++) {
       this.connection.send({ type: 'speed_chunk', size: dummyChunk.length, data: dummyChunk })
       this.bytesSent += dummyChunk.length
-      await new Promise((r) => setTimeout(r, 5))
+      await new Promise((r) => setTimeout(r, 4))
     }
 
-    const elapsedSec = Math.max(0.1, (Date.now() - startTime) / 1000)
-    const mbps = +(((dummyChunk.length * 20 * 8) / (elapsedSec * 1024 * 1024))).toFixed(2)
+    const elapsedSec = Math.max(0.08, (Date.now() - startTime) / 1000)
+    const mbps = +(((dummyChunk.length * 24 * 8) / (elapsedSec * 1024 * 1024))).toFixed(2)
     this.currentSpeedMbps = mbps
     this.emitDiagnostics()
   }
@@ -423,7 +518,7 @@ export class RealAuraMeshEngine {
         this.lastPingTime = Date.now()
         this.connection.send({ type: 'ping', timestamp: this.lastPingTime })
       }
-    }, 2500)
+    }, 2000)
   }
 
   private emitDiagnostics() {

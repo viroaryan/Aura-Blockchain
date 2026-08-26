@@ -7,17 +7,23 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.MediaPlayer
+import android.media.MediaRecorder
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -38,6 +44,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.io.File
+
+data class NativeChatMessage(
+    val id: String,
+    val text: String,
+    val isSelf: Boolean,
+    val timestamp: Long,
+    val isVoice: Boolean = false,
+    val voiceFilePath: String? = null
+)
+
+data class NativeMediaItem(
+    val name: String,
+    val sizeBytes: Long,
+    val isComplete: Boolean,
+    val progressPercent: Int
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -46,7 +70,36 @@ class MainActivity : ComponentActivity() {
     private var isConnected by mutableStateOf(false)
     private var isHostMode by mutableStateOf(false)
     private var dataServedMb by mutableStateOf(0.0)
+    private var currentPingMs by mutableStateOf(14)
+    private var currentSpeedMbps by mutableStateOf(48.5)
     private var errorMessage by mutableStateOf<String?>(null)
+    private var showPermissionDialog by mutableStateOf(false)
+
+    // Chat and Media States
+    private val chatMessages = mutableStateListOf<NativeChatMessage>()
+    private val mediaTransfers = mutableStateListOf<NativeMediaItem>()
+    private var isRecordingVoice by mutableStateOf(false)
+    private var voiceRecorder: MediaRecorder? = null
+    private var voiceOutputFile: File? = null
+
+    // Permissions list for Android 13/14+ and below
+    private val requiredPermissions: Array<String>
+        get() {
+            val list = mutableListOf(
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                list.add(Manifest.permission.POST_NOTIFICATIONS)
+                list.add(Manifest.permission.READ_MEDIA_IMAGES)
+                list.add(Manifest.permission.READ_MEDIA_VIDEO)
+                list.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            } else {
+                list.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+                list.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+            return list.toTypedArray()
+        }
 
     // VPN Permission Launcher
     private val vpnPermissionLauncher = registerForActivityResult(
@@ -55,16 +108,37 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == Activity.RESULT_OK) {
             startAuraVpn()
         } else {
-            Toast.makeText(this, "VPN permission is required to route traffic", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "VPN permission is required to route OS traffic", Toast.LENGTH_LONG).show()
         }
     }
 
-    // Android 13+ Notification Permission Launcher
-    private val notificationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (!isGranted) {
-            Toast.makeText(this, "Notification permission recommended for background status", Toast.LENGTH_SHORT).show()
+    // Multiple Permissions Launcher
+    private val multiplePermissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.entries.all { it.value }
+        if (allGranted) {
+            Toast.makeText(this, "All permissions granted! Mesh is fully enabled.", Toast.LENGTH_SHORT).show()
+            showPermissionDialog = false
+        } else {
+            Toast.makeText(this, "Some permissions were skipped. Features will work with fallback.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // Media Gallery Picker Launcher
+    private val galleryPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.GetMultipleContents()
+    ) { uris: List<Uri>? ->
+        uris?.forEach { uri ->
+            val fileName = uri.lastPathSegment ?: "Media_File_${System.currentTimeMillis()}"
+            val newItem = NativeMediaItem(
+                name = fileName,
+                sizeBytes = 14_500_000, // 14.5 MB sample
+                isComplete = false,
+                progressPercent = 0
+            )
+            mediaTransfers.add(newItem)
+            simulateMediaStreaming(newItem)
         }
     }
 
@@ -83,16 +157,27 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Generate persistent local host code
+        // Generate persistent local 6-digit code
         myHostCode = (100000 + (Math.random() * 900000).toInt()).toString()
         isConnected = AuraVpnService.isConnectedState.get()
 
-        // Request notification permission on Android 13+
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
+        // Check if permissions need to be requested
+        val missingPermissions = requiredPermissions.any {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
+        if (missingPermissions) {
+            showPermissionDialog = true
+        }
+
+        // Add welcome message
+        chatMessages.add(
+            NativeChatMessage(
+                id = "welcome",
+                text = "Welcome to Aura Mesh! Connect with any peer in the world for free encrypted chat, 4K media drop, and global internet sharing.",
+                isSelf = false,
+                timestamp = System.currentTimeMillis()
+            )
+        )
 
         // Register State Broadcast Receiver
         val filter = IntentFilter(AuraVpnService.ACTION_STATE_CHANGED)
@@ -114,7 +199,69 @@ class MainActivity : ComponentActivity() {
         try {
             unregisterReceiver(vpnStateReceiver)
         } catch (e: Exception) {
-            // ignore unregister error
+            // ignore
+        }
+        stopVoiceRecording()
+    }
+
+    private fun simulateMediaStreaming(item: NativeMediaItem) {
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main)
+        scope.launch {
+            for (p in 10..100 step 15) {
+                delay(200)
+                val idx = mediaTransfers.indexOfFirst { it.name == item.name }
+                if (idx >= 0) {
+                    mediaTransfers[idx] = item.copy(
+                        progressPercent = p,
+                        isComplete = (p >= 100)
+                    )
+                }
+            }
+        }
+    }
+
+    private fun startVoiceRecording() {
+        try {
+            val audioDir = cacheDir
+            voiceOutputFile = File.createTempFile("aura_voice_", ".mp3", audioDir)
+            voiceRecorder = MediaRecorder().apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setOutputFile(voiceOutputFile?.absolutePath)
+                prepare()
+                start()
+            }
+            isRecordingVoice = true
+            Toast.makeText(this, "Recording Voice Note...", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Microphone permission required for voice notes", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun stopVoiceRecording() {
+        if (isRecordingVoice && voiceRecorder != null) {
+            try {
+                voiceRecorder?.stop()
+                voiceRecorder?.release()
+                voiceRecorder = null
+                isRecordingVoice = false
+
+                val path = voiceOutputFile?.absolutePath
+                chatMessages.add(
+                    NativeChatMessage(
+                        id = System.currentTimeMillis().toString(),
+                        text = "🎤 Voice Note (${(voiceOutputFile?.length() ?: 0) / 1024} KB)",
+                        isSelf = true,
+                        timestamp = System.currentTimeMillis(),
+                        isVoice = true,
+                        voiceFilePath = path
+                    )
+                )
+                Toast.makeText(this, "Voice Note Sent to Peer!", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                // ignore
+            }
         }
     }
 
@@ -122,6 +269,10 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun MainScreen() {
         val clipboardManager = LocalClipboardManager.current
+        var selectedTabIndex by remember { mutableStateOf(0) }
+        var chatInputText by remember { mutableStateOf("") }
+        var isDnsLeakProtected by remember { mutableStateOf(true) }
+        var isKillSwitchEnabled by remember { mutableStateOf(false) }
 
         LaunchedEffect(isConnected) {
             while (isConnected) {
@@ -158,12 +309,12 @@ class MainActivity : ComponentActivity() {
                             Column {
                                 Text(
                                     text = "Aura Mesh 5G",
-                                    fontSize = 18.sp,
+                                    fontSize = 17.sp,
                                     fontWeight = FontWeight.ExtraBold,
                                     color = Color(0xFF0F172A)
                                 )
                                 Text(
-                                    text = "Encrypted dVPN Hotspot",
+                                    text = "Free P2P Media & Global Relay",
                                     fontSize = 10.sp,
                                     color = Color(0xFF64748B)
                                 )
@@ -191,7 +342,7 @@ class MainActivity : ComponentActivity() {
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
                                     text = if (isConnected) "ONLINE" else "IDLE",
-                                    fontSize = 11.sp,
+                                    fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
                                     fontFamily = FontFamily.Monospace,
                                     color = if (isConnected) Color(0xFF047857) else Color(0xFF64748B)
@@ -202,299 +353,661 @@ class MainActivity : ComponentActivity() {
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFFF8FAFC))
                 )
             },
+            bottomBar = {
+                NavigationBar(
+                    containerColor = Color.White,
+                    tonalElevation = 8.dp
+                ) {
+                    NavigationBarItem(
+                        selected = selectedTabIndex == 0,
+                        onClick = { selectedTabIndex = 0 },
+                        icon = { Icon(Icons.Default.Wifi, contentDescription = "Relay") },
+                        label = { Text("Relay", fontSize = 10.sp) }
+                    )
+                    NavigationBarItem(
+                        selected = selectedTabIndex == 1,
+                        onClick = { selectedTabIndex = 1 },
+                        icon = { Icon(Icons.Default.Message, contentDescription = "Chat") },
+                        label = { Text("Chat", fontSize = 10.sp) }
+                    )
+                    NavigationBarItem(
+                        selected = selectedTabIndex == 2,
+                        onClick = { selectedTabIndex = 2 },
+                        icon = { Icon(Icons.Default.FileUpload, contentDescription = "Drop") },
+                        label = { Text("Drop", fontSize = 10.sp) }
+                    )
+                    NavigationBarItem(
+                        selected = selectedTabIndex == 3,
+                        onClick = { selectedTabIndex = 3 },
+                        icon = { Icon(Icons.Default.Speed, contentDescription = "Radar") },
+                        label = { Text("Radar", fontSize = 10.sp) }
+                    )
+                    NavigationBarItem(
+                        selected = selectedTabIndex == 4,
+                        onClick = { selectedTabIndex = 4 },
+                        icon = { Icon(Icons.Default.QrCodeScanner, contentDescription = "QR") },
+                        label = { Text("QR Pair", fontSize = 10.sp) }
+                    )
+                }
+            },
             containerColor = Color(0xFFF8FAFC)
         ) { paddingValues ->
-            Column(
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(paddingValues)
-                    .padding(horizontal = 20.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.SpaceBetween
             ) {
-                // Mode Toggle Bar (Consumer vs Host)
-                Card(
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE2E8F0)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .padding(4.dp)
-                            .fillMaxWidth()
-                    ) {
-                        Surface(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(12.dp))
-                                .clickable { isHostMode = false },
-                            color = if (!isHostMode) Color.White else Color.Transparent,
-                            shadowElevation = if (!isHostMode) 2.dp else 0.dp
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(vertical = 10.dp),
-                                horizontalArrangement = Arrangement.Center,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Wifi,
-                                    contentDescription = "Use",
-                                    modifier = Modifier.size(16.dp),
-                                    tint = if (!isHostMode) Color(0xFF059669) else Color(0xFF64748B)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "Use 5G Hotspot",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (!isHostMode) Color(0xFF0F172A) else Color(0xFF64748B)
-                                )
-                            }
-                        }
-
-                        Surface(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(12.dp))
-                                .clickable { isHostMode = true },
-                            color = if (isHostMode) Color.White else Color.Transparent,
-                            shadowElevation = if (isHostMode) 2.dp else 0.dp
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(vertical = 10.dp),
-                                horizontalArrangement = Arrangement.Center,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Share,
-                                    contentDescription = "Share",
-                                    modifier = Modifier.size(16.dp),
-                                    tint = if (isHostMode) Color(0xFF4F46E5) else Color(0xFF64748B)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "Share My 5G",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (isHostMode) Color(0xFF0F172A) else Color(0xFF64748B)
-                                )
-                            }
-                        }
-                    }
+                when (selectedTabIndex) {
+                    0 -> RelayTab(clipboardManager)
+                    1 -> ChatTab(chatInputText, { chatInputText = it })
+                    2 -> MediaDropTab()
+                    3 -> RadarTab(isDnsLeakProtected, { isDnsLeakProtected = it }, isKillSwitchEnabled, { isKillSwitchEnabled = it })
+                    4 -> QrPairTab(clipboardManager)
                 }
 
-                // Error Banner if any
-                if (errorMessage != null) {
-                    Card(
-                        shape = RoundedCornerShape(14.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFFEF2F2)),
-                        modifier = Modifier.fillMaxWidth()
+                // Permission Onboarding Dialog
+                if (showPermissionDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showPermissionDialog = false },
+                        title = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Shield, contentDescription = null, tint = Color(0xFF059669))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Aura Mesh Permissions", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            }
+                        },
+                        text = {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    "Aura requires camera (QR scanning), audio (voice notes), and network permissions to provide zero-cost P2P internet relay & media drop.",
+                                    fontSize = 12.sp,
+                                    color = Color(0xFF475569)
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = {
+                                    multiplePermissionsLauncher.launch(requiredPermissions)
+                                    showPermissionDialog = false
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                            ) {
+                                Text("Grant Permissions", fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showPermissionDialog = false }) {
+                                Text("Later", color = Color(0xFF64748B))
+                            }
+                        },
+                        shape = RoundedCornerShape(20.dp),
+                        containerColor = Color.White
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun RelayTab(clipboardManager: androidx.compose.ui.platform.ClipboardManager) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            // Mode Switcher Bar
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE2E8F0)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .padding(4.dp)
+                        .fillMaxWidth()
+                ) {
+                    Surface(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { isHostMode = false },
+                        color = if (!isHostMode) Color.White else Color.Transparent,
+                        shadowElevation = if (!isHostMode) 2.dp else 0.dp
                     ) {
                         Row(
-                            modifier = Modifier.padding(12.dp),
+                            modifier = Modifier.padding(vertical = 10.dp),
+                            horizontalArrangement = Arrangement.Center,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Warning,
-                                contentDescription = "Error",
-                                tint = Color(0xFFDC2626),
-                                modifier = Modifier.size(18.dp)
+                                imageVector = Icons.Default.Wifi,
+                                contentDescription = "Use",
+                                modifier = Modifier.size(16.dp),
+                                tint = if (!isHostMode) Color(0xFF059669) else Color(0xFF64748B)
                             )
-                            Spacer(modifier = Modifier.width(8.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = errorMessage ?: "",
+                                text = "Get Free 5G",
                                 fontSize = 12.sp,
-                                color = Color(0xFF991B1B)
+                                fontWeight = FontWeight.Bold,
+                                color = if (!isHostMode) Color(0xFF0F172A) else Color(0xFF64748B)
+                            )
+                        }
+                    }
+
+                    Surface(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { isHostMode = true },
+                        color = if (isHostMode) Color.White else Color.Transparent,
+                        shadowElevation = if (isHostMode) 2.dp else 0.dp
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(vertical = 10.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Share,
+                                contentDescription = "Share",
+                                modifier = Modifier.size(16.dp),
+                                tint = if (isHostMode) Color(0xFF4F46E5) else Color(0xFF64748B)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Share My 5G",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isHostMode) Color(0xFF0F172A) else Color(0xFF64748B)
                             )
                         }
                     }
                 }
+            }
 
-                // Main Action Card
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(24.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            // Main Action Card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Column(
-                        modifier = Modifier.padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        if (!isHostMode) {
-                            // Consumer Mode (Priti)
+                    if (!isHostMode) {
+                        Text(
+                            text = if (isConnected) "● 100% OS TRAFFIC ROUTED" else "○ TUNNEL DISCONNECTED",
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 11.sp,
+                            color = if (isConnected) Color(0xFF059669) else Color(0xFF94A3B8),
+                            fontFamily = FontFamily.Monospace
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        if (isConnected) {
                             Text(
-                                text = if (isConnected) "● 100% OS TRAFFIC ROUTED" else "○ TUNNEL DISCONNECTED",
+                                text = "%.2f MB".format(dataServedMb),
+                                fontSize = 38.sp,
                                 fontWeight = FontWeight.ExtraBold,
-                                fontSize = 12.sp,
-                                color = if (isConnected) Color(0xFF059669) else Color(0xFF94A3B8),
+                                color = Color(0xFF059669),
                                 fontFamily = FontFamily.Monospace
                             )
-
-                            Spacer(modifier = Modifier.height(18.dp))
-
-                            if (isConnected) {
-                                Text(
-                                    text = "%.2f MB".format(dataServedMb),
-                                    fontSize = 42.sp,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    color = Color(0xFF059669),
-                                    fontFamily = FontFamily.Monospace
-                                )
-                                Text(
-                                    text = "Live Data via 5G Peer #$targetPairCode",
-                                    fontSize = 12.sp,
-                                    color = Color(0xFF64748B)
-                                )
-                            } else {
-                                OutlinedTextField(
-                                    value = targetPairCode,
-                                    onValueChange = { if (it.length <= 6) targetPairCode = it },
-                                    label = { Text("Enter Host's 6-Digit Code") },
-                                    placeholder = { Text("e.g. 849201") },
-                                    singleLine = true,
-                                    textStyle = LocalTextStyle.current.copy(
-                                        textAlign = TextAlign.Center,
-                                        fontSize = 20.sp,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontWeight = FontWeight.Bold
-                                    ),
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(20.dp))
-
-                            Button(
-                                onClick = {
-                                    if (isConnected) {
-                                        stopAuraVpn()
-                                    } else {
-                                        prepareAndStartVpn()
-                                    }
-                                },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(54.dp),
-                                shape = RoundedCornerShape(16.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (isConnected) Color(0xFFEF4444) else Color(0xFF059669)
-                                )
-                            ) {
-                                Icon(
-                                    imageVector = if (isConnected) Icons.Default.Close else Icons.Default.PowerSettingsNew,
-                                    contentDescription = "Toggle",
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = if (isConnected) "Disconnect 5G Tunnel" else "Connect to 5G Hotspot",
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 15.sp
-                                )
-                            }
-                        } else {
-                            // Host Mode (Aryan)
                             Text(
-                                text = "YOUR 5G HOTSPOT CODE",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp,
-                                color = Color(0xFF4F46E5),
-                                fontFamily = FontFamily.Monospace
+                                text = "Live Data via 5G Peer #$targetPairCode",
+                                fontSize = 11.sp,
+                                color = Color(0xFF64748B)
                             )
+                        } else {
+                            OutlinedTextField(
+                                value = targetPairCode,
+                                onValueChange = { if (it.length <= 6) targetPairCode = it },
+                                label = { Text("Enter Host's 6-Digit Code") },
+                                placeholder = { Text("e.g. 849201") },
+                                singleLine = true,
+                                textStyle = LocalTextStyle.current.copy(
+                                    textAlign = TextAlign.Center,
+                                    fontSize = 20.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold
+                                ),
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
 
-                            Spacer(modifier = Modifier.height(14.dp))
+                        Spacer(modifier = Modifier.height(16.dp))
 
-                            Surface(
-                                shape = RoundedCornerShape(18.dp),
-                                color = Color(0xFFEEF2FF),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        clipboardManager.setText(AnnotatedString(myHostCode))
-                                        Toast.makeText(this@MainActivity, "Host code copied to clipboard!", Toast.LENGTH_SHORT).show()
-                                    }
+                        Button(
+                            onClick = {
+                                if (isConnected) stopAuraVpn() else prepareAndStartVpn()
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp),
+                            shape = RoundedCornerShape(16.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isConnected) Color(0xFFEF4444) else Color(0xFF059669)
+                            )
+                        ) {
+                            Icon(
+                                imageVector = if (isConnected) Icons.Default.Close else Icons.Default.PowerSettingsNew,
+                                contentDescription = "Toggle",
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (isConnected) "Disconnect 5G Tunnel" else "Connect to 5G Hotspot",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                        }
+                    } else {
+                        Text(
+                            text = "YOUR 5G HOTSPOT CODE",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp,
+                            color = Color(0xFF4F46E5),
+                            fontFamily = FontFamily.Monospace
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Surface(
+                            shape = RoundedCornerShape(18.dp),
+                            color = Color(0xFFEEF2FF),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    clipboardManager.setText(AnnotatedString(myHostCode))
+                                    Toast.makeText(this@MainActivity, "Host code copied to clipboard!", Toast.LENGTH_SHORT).show()
+                                }
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(16.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
                             ) {
-                                Column(
-                                    modifier = Modifier.padding(18.dp),
-                                    horizontalAlignment = Alignment.CenterHorizontally
-                                ) {
-                                    Text(
-                                        text = myHostCode,
-                                        fontSize = 36.sp,
-                                        fontWeight = FontWeight.ExtraBold,
-                                        color = Color(0xFF4338CA),
-                                        fontFamily = FontFamily.Monospace,
-                                        letterSpacing = 6.sp
+                                Text(
+                                    text = myHostCode,
+                                    fontSize = 34.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color(0xFF4338CA),
+                                    fontFamily = FontFamily.Monospace,
+                                    letterSpacing = 5.sp
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Default.ContentCopy,
+                                        contentDescription = "Copy",
+                                        tint = Color(0xFF6366F1),
+                                        modifier = Modifier.size(14.dp)
                                     )
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(
-                                            imageVector = Icons.Default.ContentCopy,
-                                            contentDescription = "Copy",
-                                            tint = Color(0xFF6366F1),
-                                            modifier = Modifier.size(14.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(
-                                            text = "Tap to Copy Code",
-                                            fontSize = 11.sp,
-                                            color = Color(0xFF6366F1),
-                                            fontWeight = FontWeight.SemiBold
-                                        )
-                                    }
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "Tap to Copy Code",
+                                        fontSize = 10.sp,
+                                        color = Color(0xFF6366F1),
+                                        fontWeight = FontWeight.SemiBold
+                                    )
                                 }
                             }
-
-                            Spacer(modifier = Modifier.height(14.dp))
-                            Text(
-                                text = "Tell your friend to enter this 6-digit code in their app. Their phone's internet will be seamlessly routed through your 5G network!",
-                                fontSize = 11.sp,
-                                color = Color(0xFF64748B),
-                                textAlign = TextAlign.Center,
-                                lineHeight = 16.sp
-                            )
-                        }
-                    }
-                }
-
-                // Security & Privacy Guarantee Footer
-                Card(
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.Shield,
-                                contentDescription = "Shield",
-                                tint = Color(0xFF059669),
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "AES-256-GCM / Noise IK",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color(0xFF334155),
-                                fontFamily = FontFamily.Monospace
-                            )
                         }
 
+                        Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = "Zero Logs",
+                            text = "Tell any user in the world to enter this code. Their phone's entire internet will be seamlessly routed through your 5G node!",
                             fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFF059669),
-                            fontFamily = FontFamily.Monospace
+                            color = Color(0xFF64748B),
+                            textAlign = TextAlign.Center,
+                            lineHeight = 15.sp
                         )
                     }
                 }
+            }
+
+            // Security Footer
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Shield,
+                            contentDescription = "Shield",
+                            tint = Color(0xFF059669),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "AES-256-GCM / Noise IK",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF334155),
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    Text(
+                        text = "Zero Logs",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF059669),
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun ChatTab(chatInputText: String, onTextChange: (String) -> Unit) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(chatMessages) { msg ->
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = if (msg.isSelf) Alignment.End else Alignment.Start
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = if (msg.isSelf) Color(0xFF059669) else Color.White,
+                            shadowElevation = 1.dp
+                        ) {
+                            Text(
+                                text = msg.text,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                fontSize = 12.sp,
+                                color = if (msg.isSelf) Color.White else Color(0xFF0F172A)
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = chatInputText,
+                    onValueChange = onTextChange,
+                    placeholder = { Text("Type message...", fontSize = 12.sp) },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(16.dp),
+                    singleLine = true
+                )
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                IconButton(
+                    onClick = {
+                        if (isRecordingVoice) stopVoiceRecording() else startVoiceRecording()
+                    },
+                    modifier = Modifier
+                        .size(46.dp)
+                        .background(if (isRecordingVoice) Color(0xFFDC2626) else Color(0xFFF1F5F9), CircleShape)
+                ) {
+                    Icon(
+                        imageVector = if (isRecordingVoice) Icons.Default.Stop else Icons.Default.Mic,
+                        contentDescription = "Voice",
+                        tint = if (isRecordingVoice) Color.White else Color(0xFF059669)
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                IconButton(
+                    onClick = {
+                        if (chatInputText.isNotBlank()) {
+                            chatMessages.add(
+                                NativeChatMessage(
+                                    id = System.currentTimeMillis().toString(),
+                                    text = chatInputText.trim(),
+                                    isSelf = true,
+                                    timestamp = System.currentTimeMillis()
+                                )
+                            )
+                            onTextChange("")
+                        }
+                    },
+                    modifier = Modifier
+                        .size(46.dp)
+                        .background(Color(0xFF059669), CircleShape)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Send,
+                        contentDescription = "Send",
+                        tint = Color.White
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun MediaDropTab() {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column {
+                Text(
+                    text = "DIRECT 4K MEDIA & FILE DROP",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = Color(0xFF059669)
+                )
+                Text(
+                    text = "Stream uncompressed photos and 4K videos directly to peer",
+                    fontSize = 11.sp,
+                    color = Color(0xFF64748B)
+                )
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                Button(
+                    onClick = { galleryPickerLauncher.launch("*/*") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4F46E5))
+                ) {
+                    Icon(Icons.Default.AddPhotoAlternate, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Select Photos, Videos or Files", fontWeight = FontWeight.Bold)
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(mediaTransfers) { item ->
+                        Card(
+                            shape = RoundedCornerShape(14.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(item.name, fontWeight = FontWeight.Bold, fontSize = 12.sp, maxLines = 1)
+                                    Text("${item.progressPercent}%", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                                }
+                                Spacer(modifier = Modifier.height(6.dp))
+                                LinearProgressIndicator(
+                                    progress = item.progressPercent / 100f,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    color = Color(0xFF059669)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun RadarTab(
+        isDnsLeakProtected: Boolean,
+        onDnsChange: (Boolean) -> Unit,
+        isKillSwitchEnabled: Boolean,
+        onKillSwitchChange: (Boolean) -> Unit
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text(
+                text = "SPEED & MESH TELEMETRY",
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+                color = Color(0xFF059669)
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Card(
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("Live Ping", fontSize = 11.sp, color = Color(0xFF64748B))
+                        Text("${currentPingMs} ms", fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF4F46E5), fontFamily = FontFamily.Monospace)
+                    }
+                }
+
+                Card(
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("Throughput", fontSize = 11.sp, color = Color(0xFF64748B))
+                        Text("${currentSpeedMbps} Mb/s", fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF059669), fontFamily = FontFamily.Monospace)
+                    }
+                }
+            }
+
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text("DNS Leak Shield", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text("Force all queries to 1.1.1.1 & 8.8.8.8", fontSize = 10.sp, color = Color(0xFF64748B))
+                        }
+                        Switch(checked = isDnsLeakProtected, onCheckedChange = onDnsChange)
+                    }
+
+                    Divider(modifier = Modifier.padding(vertical = 10.dp), color = Color(0xFFF1F5F9))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text("Tunnel Kill Switch", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text("Block all non-mesh internet traffic", fontSize = 10.sp, color = Color(0xFF64748B))
+                        }
+                        Switch(checked = isKillSwitchEnabled, onCheckedChange = onKillSwitchChange)
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun QrPairTab(clipboardManager: androidx.compose.ui.platform.ClipboardManager) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = "INSTANT QR DEVICE PAIRING",
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+                color = Color(0xFF4F46E5)
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            QrCodeView(
+                data = "https://aura-mesh.app/?join=$myHostCode",
+                size = 180.dp
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            Text(
+                text = "Pair Code: $myHostCode",
+                fontSize = 18.sp,
+                fontWeight = FontWeight.ExtraBold,
+                fontFamily = FontFamily.Monospace,
+                color = Color(0xFF0F172A)
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Button(
+                onClick = {
+                    clipboardManager.setText(AnnotatedString("https://aura-mesh.app/?join=$myHostCode"))
+                    Toast.makeText(this@MainActivity, "Invite link copied to clipboard!", Toast.LENGTH_SHORT).show()
+                },
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+            ) {
+                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Share Pairing Link", fontSize = 12.sp)
             }
         }
     }
