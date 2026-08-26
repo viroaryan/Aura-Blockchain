@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aura-crypto",
+    "crates/aura-primitives",
+    "crates/aura-storage",
+    "crates/aura-mempool",
+    "crates/aura-consensus",
+    "crates/aura-network",
+    "crates/aura-rpc",
+    "crates/aura-metrics",
+    "crates/aura-node",
+    "crates/aura-tunnel",
+    "crates/aura-test-harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Aura Core Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aura-network/aura"
+
+[workspace.dependencies]
+# Aura Crates
+aura-crypto = { path = "crates/aura-crypto" }
+aura-primitives = { path = "crates/aura-primitives" }
+aura-storage = { path = "crates/aura-storage" }
+aura-mempool = { path = "crates/aura-mempool" }
+aura-consensus = { path = "crates/aura-consensus" }
+aura-network = { path = "crates/aura-network" }
+aura-rpc = { path = "crates/aura-rpc" }
+aura-metrics = { path = "crates/aura-metrics" }
+aura-node = { path = "crates/aura-node" }
+aura-tunnel = { path = "crates/aura-tunnel" }
+aura-test-harness = { path = "crates/aura-test-harness" }
+
+# Cryptography & Serialization
+blake3 = "1.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+rand = "0.8"
+bech32 = "0.11"
+bip39 = "2.0"
+hmac = "0.12"
+sha2 = "0.10"
+hex = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Async, Networking & RPC
+tokio = { version = "1.38", features = ["full"] }
+tokio-tungstenite = "0.23"
+futures = "0.3"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Utilities & Concurrency
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+prometheus = "0.13"
+tempfile = "3.10"
+crc32fast = "1.4"

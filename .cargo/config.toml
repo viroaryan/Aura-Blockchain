@@ -1,0 +1,8 @@
+[build]
+target-dir = "C:/Users/aryan/.cargo/target/cryptocurrency"
+
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

@@ -1,0 +1,30 @@
+[package]
+name = "aura-test-harness"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-crypto.workspace = true
+aura-primitives.workspace = true
+aura-storage.workspace = true
+aura-mempool.workspace = true
+aura-consensus.workspace = true
+aura-network.workspace = true
+aura-rpc.workspace = true
+aura-metrics.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+axum.workspace = true

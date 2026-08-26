@@ -1,0 +1,29 @@
+[package]
+name = "aura-rpc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-crypto.workspace = true
+aura-primitives.workspace = true
+aura-storage.workspace = true
+aura-mempool.workspace = true
+aura-consensus.workspace = true
+aura-network.workspace = true
+aura-metrics.workspace = true
+tokio.workspace = true
+futures.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

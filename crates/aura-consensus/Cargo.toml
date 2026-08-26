@@ -1,0 +1,23 @@
+[package]
+name = "aura-consensus"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-crypto.workspace = true
+aura-primitives.workspace = true
+aura-storage.workspace = true
+aura-mempool.workspace = true
+blake3.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
