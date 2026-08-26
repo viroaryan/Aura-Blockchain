@@ -1,19 +1,17 @@
-/**
- * Aura P2P Mesh & WebRTC Tunnel Protocol Engine
- * Handles zero-knowledge End-to-End Encrypted DataChannels, Keep-Alive Heartbeats,
- * Direct Messaging, Chunked Media/File Transfer, and Remote Bandwidth Forwarding.
- */
+import type Peer from 'peerjs'
+import type { DataConnection } from 'peerjs'
 
 export interface PeerMessage {
   id: string
   sender: 'self' | 'peer'
   text?: string
   timestamp: number
-  type: 'text' | 'file_meta' | 'bandwidth_stat' | 'ping' | 'pong'
+  type: 'chat' | 'file_meta' | 'file_chunk' | 'ping' | 'pong' | 'speed_chunk'
   fileMeta?: {
-    name: string
-    size: number
-    type: string
+    fileId: string
+    fileName: string
+    fileSize: number
+    fileType: string
     chunksTotal: number
   }
 }
@@ -27,358 +25,435 @@ export interface FileTransferProgress {
   progressPercent: number
   isComplete: boolean
   downloadUrl?: string
+  sender: 'self' | 'peer'
 }
 
-export interface TunnelDiagnostics {
+export interface LiveMeshDiagnostics {
   pingMs: number
-  packetLossPercent: number
-  encryptionCipher: string
   bytesSent: number
   bytesReceived: number
-  activeRole: 'consumer' | 'host'
-  virtualGateway: string
-  connectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
+  realSpeedMbps: number
+  connectionState: 'disconnected' | 'connecting' | 'connected'
+  remotePeerId?: string
 }
 
-export class AuraMeshEngine {
-  private peerConnection: RTCPeerConnection | null = null
-  private dataChannel: RTCDataChannel | null = null
-  private heartbeatTimer: any = null
-  private onMessageCallback: ((msg: PeerMessage) => void) | null = null
-  private onFileProgressCallback: ((progress: FileTransferProgress) => void) | null = null
-  private onDiagnosticsCallback: ((diag: TunnelDiagnostics) => void) | null = null
+export class RealAuraMeshEngine {
+  private peer: Peer | null = null
+  private connection: DataConnection | null = null
+  private myPeerId: string = ''
+  private heartbeatInterval: any = null
 
-  private receivedChunks: Map<string, { chunks: Uint8Array[]; total: number; meta: any }> = new Map()
   private bytesSent = 0
   private bytesReceived = 0
-  private lastPingTimestamp = 0
-  private currentPing = 18
+  private lastPingTime = 0
+  private currentPing = 0
+  private currentSpeedMbps = 0
+
+  private onMessageCb: ((msg: PeerMessage) => void) | null = null
+  private onFileProgressCb: ((progress: FileTransferProgress) => void) | null = null
+  private onDiagnosticsCb: ((diag: LiveMeshDiagnostics) => void) | null = null
+  private onStateChangeCb: ((state: 'disconnected' | 'connecting' | 'connected', peerId?: string) => void) | null = null
+
+  // File chunk assembly buffer: fileId -> { chunks, meta }
+  private fileBuffers: Map<string, { chunks: Uint8Array[]; meta: any; received: number }> = new Map()
 
   constructor() {}
 
   public onMessage(cb: (msg: PeerMessage) => void) {
-    this.onMessageCallback = cb
+    this.onMessageCb = cb
   }
 
   public onFileProgress(cb: (progress: FileTransferProgress) => void) {
-    this.onFileProgressCallback = cb
+    this.onFileProgressCb = cb
   }
 
-  public onDiagnostics(cb: (diag: TunnelDiagnostics) => void) {
-    this.onDiagnosticsCallback = cb
+  public onDiagnostics(cb: (diag: LiveMeshDiagnostics) => void) {
+    this.onDiagnosticsCb = cb
   }
 
-  /**
-   * Generate a deterministic 6-digit pairing code from Aura Address or random seed
-   */
-  public static generatePairingCode(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString()
+  public onStateChange(cb: (state: 'disconnected' | 'connecting' | 'connected', peerId?: string) => void) {
+    this.onStateChangeCb = cb
   }
 
   /**
-   * Initialize WebRTC Peer Connection with STUN / TURN servers
+   * Initialize local Peer instance with public STUN/TURN broker
    */
-  public async initHost(): Promise<{ pairCode: string; offerSdp: string }> {
-    const pairCode = AuraMeshEngine.generatePairingCode()
+  public async init(custom6DigitCode?: string): Promise<string> {
+    if (typeof window === 'undefined') return ''
 
-    const config: RTCConfiguration = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
-    }
+    // Dynamically import peerjs on client-side only
+    const { default: PeerClass } = await import('peerjs')
 
-    this.peerConnection = new RTCPeerConnection(config)
+    const randomSuffix = custom6DigitCode || Math.floor(100000 + Math.random() * 900000).toString()
+    const targetPeerId = `aura-${randomSuffix}`
 
-    // Create DataChannel with reliable binary streaming
-    this.dataChannel = this.peerConnection.createDataChannel('aura-mesh-tunnel', {
-      ordered: true,
-    })
-    this.setupDataChannelEvents(this.dataChannel)
+    return new Promise((resolve, reject) => {
+      try {
+        const peer = new PeerClass(targetPeerId, {
+          debug: 0,
+          config: {
+            iceServers: [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:stun1.l.google.com:19302' },
+              { urls: 'stun:stun2.l.google.com:19302' },
+            ],
+          },
+        })
 
-    this.peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
-        // ICE candidate discovered
+        this.peer = peer
+
+        peer.on('open', (id) => {
+          this.myPeerId = id
+          const shortCode = id.replace('aura-', '')
+          resolve(shortCode)
+        })
+
+        peer.on('connection', (conn) => {
+          this.handleIncomingConnection(conn)
+        })
+
+        peer.on('error', (err) => {
+          console.warn('PeerJS event:', err.type)
+          if (err.type === 'unavailable-id') {
+            // Generate fallback random ID
+            const fallbackSuffix = Math.floor(100000 + Math.random() * 900000).toString()
+            const fallbackPeer = new PeerClass(`aura-${fallbackSuffix}`)
+            this.peer = fallbackPeer
+            fallbackPeer.on('open', (id) => {
+              this.myPeerId = id
+              resolve(id.replace('aura-', ''))
+            })
+            fallbackPeer.on('connection', (conn) => this.handleIncomingConnection(conn))
+          }
+        })
+      } catch (e) {
+        reject(e)
       }
+    })
+  }
+
+  /**
+   * Connect to another peer by their 6-digit code
+   */
+  public connectToPeer(target6DigitCode: string): Promise<boolean> {
+    const fullPeerId = `aura-${target6DigitCode.trim()}`
+    if (!this.peer) return Promise.resolve(false)
+
+    if (this.onStateChangeCb) this.onStateChangeCb('connecting', fullPeerId)
+
+    const conn = this.peer.connect(fullPeerId, {
+      reliable: true,
+    })
+
+    return new Promise((resolve) => {
+      conn.on('open', () => {
+        this.connection = conn
+        this.setupConnectionHandlers(conn)
+        if (this.onStateChangeCb) this.onStateChangeCb('connected', fullPeerId)
+        this.startHeartbeat()
+        resolve(true)
+      })
+
+      conn.on('error', () => {
+        if (this.onStateChangeCb) this.onStateChangeCb('disconnected')
+        resolve(false)
+      })
+    })
+  }
+
+  /**
+   * Handle incoming connection when acting as Host
+   */
+  private handleIncomingConnection(conn: DataConnection) {
+    this.connection = conn
+    if (this.onStateChangeCb) this.onStateChangeCb('connecting', conn.peer)
+
+    conn.on('open', () => {
+      this.setupConnectionHandlers(conn)
+      if (this.onStateChangeCb) this.onStateChangeCb('connected', conn.peer)
+      this.startHeartbeat()
+    })
+  }
+
+  /**
+   * Setup wire event listeners for real WebRTC DataChannel
+   */
+  private setupConnectionHandlers(conn: DataConnection) {
+    conn.on('data', (data: any) => {
+      this.handleIncomingData(data)
+    })
+
+    conn.on('close', () => {
+      this.cleanupConnection()
+    })
+
+    conn.on('error', () => {
+      this.cleanupConnection()
+    })
+  }
+
+  /**
+   * Process incoming real packets
+   */
+  private handleIncomingData(data: any) {
+    if (!data) return
+
+    // 1. Text Message
+    if (data.type === 'chat') {
+      this.bytesReceived += data.text?.length || 0
+      if (this.onMessageCb) {
+        this.onMessageCb({
+          id: data.id || Math.random().toString(36).substring(7),
+          sender: 'peer',
+          text: data.text,
+          timestamp: data.timestamp || Date.now(),
+          type: 'chat',
+        })
+      }
+      this.emitDiagnostics()
+      return
     }
 
-    const offer = await this.peerConnection.createOffer()
-    await this.peerConnection.setLocalDescription(offer)
+    // 2. Keep-Alive Ping / Pong
+    if (data.type === 'ping') {
+      this.connection?.send({ type: 'pong', timestamp: data.timestamp })
+      return
+    }
+    if (data.type === 'pong') {
+      this.currentPing = Math.max(1, Date.now() - data.timestamp)
+      this.emitDiagnostics()
+      return
+    }
 
-    this.startHeartbeat()
+    // 3. File Metadata Header
+    if (data.type === 'file_meta') {
+      const meta = data.fileMeta
+      this.fileBuffers.set(meta.fileId, {
+        chunks: [],
+        meta,
+        received: 0,
+      })
 
-    return {
-      pairCode,
-      offerSdp: btoa(JSON.stringify(offer)),
+      if (this.onFileProgressCb) {
+        this.onFileProgressCb({
+          id: meta.fileId,
+          fileName: meta.fileName,
+          fileSize: meta.fileSize,
+          fileType: meta.fileType,
+          receivedBytes: 0,
+          progressPercent: 0,
+          isComplete: false,
+          sender: 'peer',
+        })
+      }
+      return
+    }
+
+    // 4. File Binary Chunk
+    if (data.type === 'file_chunk') {
+      const { fileId, chunkIdx, chunkBytes } = data
+      const entry = this.fileBuffers.get(fileId)
+      if (!entry) return
+
+      const bytes = new Uint8Array(chunkBytes)
+      entry.chunks[chunkIdx] = bytes
+      entry.received += bytes.length
+      this.bytesReceived += bytes.length
+
+      const percent = Math.min(100, Math.round((entry.received / entry.meta.fileSize) * 100))
+      const isComplete = entry.received >= entry.meta.fileSize || entry.chunks.filter(Boolean).length >= entry.meta.chunksTotal
+
+      let downloadUrl: string | undefined
+      if (isComplete) {
+        const blob = new Blob(entry.chunks as any, { type: entry.meta.fileType || 'application/octet-stream' })
+        downloadUrl = URL.createObjectURL(blob)
+      }
+
+      if (this.onFileProgressCb) {
+        this.onFileProgressCb({
+          id: fileId,
+          fileName: entry.meta.fileName,
+          fileSize: entry.meta.fileSize,
+          fileType: entry.meta.fileType,
+          receivedBytes: entry.received,
+          progressPercent: percent,
+          isComplete,
+          downloadUrl,
+          sender: 'peer',
+        })
+      }
+
+      this.emitDiagnostics()
+      return
+    }
+
+    // 5. Bandwidth Burst Chunk
+    if (data.type === 'speed_chunk') {
+      this.bytesReceived += data.size || 0
+      this.emitDiagnostics()
     }
   }
 
   /**
-   * Join an existing host using Pair Code / Offer SDP
+   * Send real chat message
    */
-  public async joinPeer(remoteOfferBase64: string): Promise<{ answerSdp: string }> {
-    const config: RTCConfiguration = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
-    }
+  public sendChatMessage(text: string) {
+    if (!this.connection || !text.trim()) return
 
-    this.peerConnection = new RTCPeerConnection(config)
-
-    this.peerConnection.ondatachannel = (event) => {
-      this.dataChannel = event.channel
-      this.setupDataChannelEvents(this.dataChannel)
-    }
-
-    const offer = JSON.parse(atob(remoteOfferBase64))
-    await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer))
-
-    const answer = await this.peerConnection.createAnswer()
-    await this.peerConnection.setLocalDescription(answer)
-
-    this.startHeartbeat()
-
-    return {
-      answerSdp: btoa(JSON.stringify(answer)),
-    }
-  }
-
-  /**
-   * Complete pairing on Host with Answer SDP
-   */
-  public async acceptAnswer(answerBase64: string) {
-    if (!this.peerConnection) return
-    const answer = JSON.parse(atob(answerBase64))
-    await this.peerConnection.setRemoteDescription(new RTCSessionDescription(answer))
-  }
-
-  /**
-   * Send text message over encrypted DataChannel
-   */
-  public sendTextMessage(text: string) {
-    const msg: PeerMessage = {
+    const msg = {
+      type: 'chat',
       id: Math.random().toString(36).substring(7),
-      sender: 'self',
-      text,
+      text: text.trim(),
       timestamp: Date.now(),
-      type: 'text',
     }
 
-    if (this.dataChannel && this.dataChannel.readyState === 'open') {
-      this.dataChannel.send(JSON.stringify({ ...msg, sender: 'peer' }))
-    }
-
+    this.connection.send(msg)
     this.bytesSent += text.length
-    if (this.onMessageCallback) {
-      this.onMessageCallback(msg)
+
+    if (this.onMessageCb) {
+      this.onMessageCb({
+        id: msg.id,
+        sender: 'self',
+        text: msg.text,
+        timestamp: msg.timestamp,
+        type: 'chat',
+      })
     }
+    this.emitDiagnostics()
   }
 
   /**
-   * High-speed chunked file/media transfer (64KB chunks)
+   * Send real file in 16KB binary chunks
    */
-  public async sendFile(file: File) {
-    const CHUNK_SIZE = 64 * 1024 // 64 KB per chunk
+  public async sendRealFile(file: File) {
+    if (!this.connection) return
+
+    const CHUNK_SIZE = 16 * 1024 // 16 KB per WebRTC frame
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
     const fileId = Math.random().toString(36).substring(7)
 
-    // 1. Send File Metadata Header
-    const metaMsg: PeerMessage = {
-      id: fileId,
-      sender: 'self',
-      timestamp: Date.now(),
+    // Send metadata
+    this.connection.send({
       type: 'file_meta',
       fileMeta: {
-        name: file.name,
-        size: file.size,
-        type: file.type || 'application/octet-stream',
+        fileId,
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type || 'application/octet-stream',
         chunksTotal: totalChunks,
       },
+    })
+
+    if (this.onFileProgressCb) {
+      this.onFileProgressCb({
+        id: fileId,
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type,
+        receivedBytes: 0,
+        progressPercent: 0,
+        isComplete: false,
+        sender: 'self',
+      })
     }
 
-    if (this.dataChannel && this.dataChannel.readyState === 'open') {
-      this.dataChannel.send(JSON.stringify({ ...metaMsg, sender: 'peer' }))
-    }
-
-    if (this.onMessageCallback) {
-      this.onMessageCallback(metaMsg)
-    }
-
-    // 2. Stream Binary Chunks
     const arrayBuffer = await file.arrayBuffer()
     let offset = 0
-    let chunkIndex = 0
+    let chunkIdx = 0
 
     while (offset < file.size) {
       const slice = arrayBuffer.slice(offset, offset + CHUNK_SIZE)
-      const chunkBytes = new Uint8Array(slice)
+      const chunkBytes = Array.from(new Uint8Array(slice))
 
-      if (this.dataChannel && this.dataChannel.readyState === 'open') {
-        // Send chunk frame: fileId (8 bytes ascii) + chunkIndex (4 bytes) + binary payload
-        const header = new TextEncoder().encode(fileId.padEnd(8, ' '))
-        const idxBytes = new Uint8Array(new Uint32Array([chunkIndex]).buffer)
-        const packet = new Uint8Array(header.length + idxBytes.length + chunkBytes.length)
-        packet.set(header, 0)
-        packet.set(idxBytes, 8)
-        packet.set(chunkBytes, 12)
-
-        this.dataChannel.send(packet)
-      }
+      this.connection.send({
+        type: 'file_chunk',
+        fileId,
+        chunkIdx,
+        chunkBytes,
+      })
 
       offset += CHUNK_SIZE
-      chunkIndex++
-      this.bytesSent += chunkBytes.length
+      chunkIdx++
+      this.bytesSent += slice.byteLength
 
-      if (this.onFileProgressCallback) {
-        this.onFileProgressCallback({
+      const percent = Math.min(100, Math.round((Math.min(offset, file.size) / file.size) * 100))
+      if (this.onFileProgressCb) {
+        this.onFileProgressCb({
           id: fileId,
           fileName: file.name,
           fileSize: file.size,
           fileType: file.type,
           receivedBytes: Math.min(offset, file.size),
-          progressPercent: Math.round((Math.min(offset, file.size) / file.size) * 100),
+          progressPercent: percent,
           isComplete: offset >= file.size,
+          sender: 'self',
         })
       }
 
-      // Micro-sleep to prevent buffer saturation on high-speed transfer
-      await new Promise((r) => setTimeout(r, 2))
+      this.emitDiagnostics()
+      // Small pause to prevent buffer overflow
+      await new Promise((r) => setTimeout(r, 8))
     }
   }
 
   /**
-   * Set up DataChannel events for incoming stream
+   * Run real speed burst test between peers
    */
-  private setupDataChannelEvents(channel: RTCDataChannel) {
-    channel.binaryType = 'arraybuffer'
+  public async runSpeedBurst() {
+    if (!this.connection) return
+    const dummyChunk = new Array(8192).fill(0xaa) // 8KB
+    const startTime = Date.now()
 
-    channel.onopen = () => {
-      this.updateDiagnostics('connected')
+    for (let i = 0; i < 20; i++) {
+      this.connection.send({ type: 'speed_chunk', size: dummyChunk.length, data: dummyChunk })
+      this.bytesSent += dummyChunk.length
+      await new Promise((r) => setTimeout(r, 5))
     }
 
-    channel.onclose = () => {
-      this.updateDiagnostics('disconnected')
-    }
-
-    channel.onmessage = (event) => {
-      if (typeof event.data === 'string') {
-        // JSON Control or Text Message
-        try {
-          const parsed = JSON.parse(event.data)
-          if (parsed.type === 'ping') {
-            channel.send(JSON.stringify({ type: 'pong', timestamp: parsed.timestamp }))
-            return
-          }
-          if (parsed.type === 'pong') {
-            this.currentPing = Date.now() - parsed.timestamp
-            return
-          }
-          if (this.onMessageCallback) {
-            this.onMessageCallback(parsed)
-          }
-        } catch (e) {}
-      } else if (event.data instanceof ArrayBuffer) {
-        // Binary Chunk Frame
-        const bytes = new Uint8Array(event.data)
-        this.bytesReceived += bytes.length
-        this.handleIncomingChunk(bytes)
-      }
-    }
+    const elapsedSec = Math.max(0.1, (Date.now() - startTime) / 1000)
+    const mbps = +(((dummyChunk.length * 20 * 8) / (elapsedSec * 1024 * 1024))).toFixed(2)
+    this.currentSpeedMbps = mbps
+    this.emitDiagnostics()
   }
 
-  /**
-   * Handle incoming binary chunks and assemble downloaded files
-   */
-  private handleIncomingChunk(bytes: Uint8Array) {
-    if (bytes.length < 12) return
-
-    const fileId = new TextDecoder().decode(bytes.slice(0, 8)).trim()
-    const chunkIdx = new Uint32Array(bytes.slice(8, 12).buffer)[0]
-    const payload = bytes.slice(12)
-
-    let entry = this.receivedChunks.get(fileId)
-    if (!entry) {
-      entry = { chunks: [], total: 0, meta: null }
-      this.receivedChunks.set(fileId, entry)
-    }
-
-    entry.chunks[chunkIdx] = payload
-    const receivedBytes = entry.chunks.reduce((sum, c) => sum + (c ? c.length : 0), 0)
-
-    if (this.onFileProgressCallback) {
-      this.onFileProgressCallback({
-        id: fileId,
-        fileName: entry.meta?.name || 'Incoming_File',
-        fileSize: entry.meta?.size || receivedBytes,
-        fileType: entry.meta?.type || 'application/octet-stream',
-        receivedBytes,
-        progressPercent: entry.meta?.size ? Math.round((receivedBytes / entry.meta.size) * 100) : 50,
-        isComplete: entry.meta?.chunksTotal ? entry.chunks.filter(Boolean).length >= entry.meta.chunksTotal : false,
-      })
-    }
-
-    // If complete, assemble blob
-    if (entry.meta && entry.chunks.filter(Boolean).length >= entry.meta.chunksTotal) {
-      const blob = new Blob(entry.chunks as any, { type: entry.meta.type })
-      const downloadUrl = URL.createObjectURL(blob)
-      if (this.onFileProgressCallback) {
-        this.onFileProgressCallback({
-          id: fileId,
-          fileName: entry.meta.name,
-          fileSize: entry.meta.size,
-          fileType: entry.meta.type,
-          receivedBytes: entry.meta.size,
-          progressPercent: 100,
-          isComplete: true,
-          downloadUrl,
-        })
-      }
-    }
-  }
-
-  /**
-   * 5-second Keep-Alive Heartbeat loop
-   */
   private startHeartbeat() {
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
-    this.heartbeatTimer = setInterval(() => {
-      if (this.dataChannel && this.dataChannel.readyState === 'open') {
-        this.lastPingTimestamp = Date.now()
-        this.dataChannel.send(JSON.stringify({ type: 'ping', timestamp: this.lastPingTimestamp }))
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval)
+    this.heartbeatInterval = setInterval(() => {
+      if (this.connection) {
+        this.lastPingTime = Date.now()
+        this.connection.send({ type: 'ping', timestamp: this.lastPingTime })
       }
-      this.updateDiagnostics(this.dataChannel?.readyState === 'open' ? 'connected' : 'disconnected')
-    }, 3000)
+    }, 2500)
   }
 
-  /**
-   * Update live diagnostics
-   */
-  private updateDiagnostics(state: 'disconnected' | 'connecting' | 'connected' | 'reconnecting') {
-    if (this.onDiagnosticsCallback) {
-      this.onDiagnosticsCallback({
+  private emitDiagnostics() {
+    if (this.onDiagnosticsCb) {
+      this.onDiagnosticsCb({
         pingMs: this.currentPing,
-        packetLossPercent: 0.0,
-        encryptionCipher: 'ChaCha20-Poly1305 + Noise IK',
         bytesSent: this.bytesSent,
         bytesReceived: this.bytesReceived,
-        activeRole: 'consumer',
-        virtualGateway: '10.8.0.1 (Aura Virtual TUN)',
-        connectionState: state,
+        realSpeedMbps: this.currentSpeedMbps,
+        connectionState: this.connection ? 'connected' : 'disconnected',
+        remotePeerId: this.connection?.peer,
       })
     }
+  }
+
+  public cleanupConnection() {
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval)
+    if (this.connection) {
+      this.connection.close()
+      this.connection = null
+    }
+    if (this.onStateChangeCb) this.onStateChangeCb('disconnected')
+    this.emitDiagnostics()
   }
 
   public disconnect() {
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
-    if (this.dataChannel) {
-      this.dataChannel.close()
-      this.dataChannel = null
+    this.cleanupConnection()
+    if (this.peer) {
+      this.peer.destroy()
+      this.peer = null
     }
-    if (this.peerConnection) {
-      this.peerConnection.close()
-      this.peerConnection = null
-    }
-    this.updateDiagnostics('disconnected')
   }
 }
