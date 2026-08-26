@@ -1,10 +1,52 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!-- Outer Radiating Mesh Rings -->
+    <path
+        android:strokeColor="#34D399"
+        android:strokeWidth="2"
+        android:strokeAlpha="0.35"
+        android:pathData="M54,22 A32,32 0 1,0 54,86 A32,32 0 1,0 54,22 Z" />
+
+    <path
+        android:strokeColor="#10B981"
+        android:strokeWidth="2.5"
+        android:strokeAlpha="0.65"
+        android:pathData="M54,30 A24,24 0 1,0 54,78 A24,24 0 1,0 54,30 Z" />
+
+    <!-- Sleek Security Shield Geometry -->
+    <path
+        android:strokeColor="#06B6D4"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M54,32 L68,38 C68,54 54,66 54,72 C54,66 40,54 40,38 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="40"
+                android:startY="32"
+                android:endX="68"
+                android:endY="72">
+                <item android:color="#059669" android:offset="0.0"/>
+                <item android:color="#0D9488" android:offset="0.6"/>
+                <item android:color="#0284C7" android:offset="1.0"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Center 5G Lightning Core Node -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,28 A26,26 0 1,0 54,80 A26,26 0 1,0 54,28 Z M54,36 A18,18 0 1,1 54,72 A18,18 0 1,1 54,36 Z"/>
+        android:pathData="M56,40 L48,51 L53,51 L51,63 L61,50 L55,50 Z" />
+
+    <!-- Pulse Beacon Dot -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M54,26 A2.5,2.5 0 1,0 54,31 A2.5,2.5 0 1,0 54,26 Z" />
 </vector>

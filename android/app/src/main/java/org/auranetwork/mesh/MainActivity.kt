@@ -25,6 +25,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Message
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -119,10 +121,14 @@ class MainActivity : ComponentActivity() {
     private val multiplePermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
+        getSharedPreferences("aura_mesh_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("has_asked_permissions", true)
+            .apply()
+        showPermissionDialog = false
         val allGranted = permissions.entries.all { it.value }
         if (allGranted) {
-            Toast.makeText(this, "All permissions granted! Mesh is active.", Toast.LENGTH_SHORT).show()
-            showPermissionDialog = false
+            Toast.makeText(this, "All permissions configured! Aura 5G Mesh is active.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -163,23 +169,27 @@ class MainActivity : ComponentActivity() {
         isConnected = AuraVpnService.isConnectedState.get()
         isHostActive = AuraHostService.isHostRunningState.get()
 
-        // Check missing permissions
+        // Check if permissions were already asked once - if yes, do NOT ask again!
+        val prefs = getSharedPreferences("aura_mesh_prefs", Context.MODE_PRIVATE)
+        val hasAskedBefore = prefs.getBoolean("has_asked_permissions", false)
         val missingPermissions = requiredPermissions.any {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (missingPermissions) {
+        if (missingPermissions && !hasAskedBefore) {
             showPermissionDialog = true
         }
 
         // Add welcome message
-        chatMessages.add(
-            NativeChatMessage(
-                id = "welcome",
-                text = "Welcome to Aura Mesh! 100% Real P2P Free Media, Messaging & Global Internet Relay.",
-                isSelf = false,
-                timestamp = System.currentTimeMillis()
+        if (chatMessages.isEmpty()) {
+            chatMessages.add(
+                NativeChatMessage(
+                    id = "welcome",
+                    text = "Welcome to Aura 5G Mesh! 100% Real P2P Free Media, Voice & Global Internet Relay.",
+                    isSelf = false,
+                    timestamp = System.currentTimeMillis()
+                )
             )
-        )
+        }
 
         // Register State Broadcast Receiver
         val filter = IntentFilter(AuraVpnService.ACTION_STATE_CHANGED)
@@ -226,7 +236,8 @@ class MainActivity : ComponentActivity() {
         try {
             val audioDir = cacheDir
             voiceOutputFile = File.createTempFile("aura_voice_", ".mp3", audioDir)
-            voiceRecorder = MediaRecorder().apply {
+            @Suppress("DEPRECATION")
+            voiceRecorder = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MediaRecorder(this) else MediaRecorder()).apply {
                 setAudioSource(MediaRecorder.AudioSource.MIC)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
@@ -318,7 +329,7 @@ class MainActivity : ComponentActivity() {
                             Spacer(modifier = Modifier.width(10.dp))
                             Column {
                                 Text(
-                                    text = "Aura Mesh 5G",
+                                    text = "Aura 5G Mesh",
                                     fontSize = 17.sp,
                                     fontWeight = FontWeight.ExtraBold,
                                     color = Color(0xFF0F172A)
@@ -377,7 +388,7 @@ class MainActivity : ComponentActivity() {
                     NavigationBarItem(
                         selected = selectedTabIndex == 1,
                         onClick = { selectedTabIndex = 1 },
-                        icon = { Icon(Icons.Default.Message, contentDescription = "Chat") },
+                        icon = { Icon(Icons.AutoMirrored.Filled.Message, contentDescription = "Chat") },
                         label = { Text("Chat", fontSize = 10.sp) }
                     )
                     NavigationBarItem(
@@ -432,21 +443,27 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Permission Onboarding Dialog
+                // Permission Onboarding Dialog - Shown ONLY ONCE!
                 if (showPermissionDialog) {
                     AlertDialog(
-                        onDismissRequest = { showPermissionDialog = false },
+                        onDismissRequest = {
+                            getSharedPreferences("aura_mesh_prefs", Context.MODE_PRIVATE)
+                                .edit()
+                                .putBoolean("has_asked_permissions", true)
+                                .apply()
+                            showPermissionDialog = false
+                        },
                         title = {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(Icons.Default.Shield, contentDescription = null, tint = Color(0xFF059669))
                                 Spacer(modifier = Modifier.width(8.dp))
-                                Text("Aura Mesh Permissions", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                Text("Aura 5G Mesh Permissions", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                             }
                         },
                         text = {
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text(
-                                    "Aura requires camera (QR scanning), audio (voice notes), and network permissions to provide real 5G internet sharing & 4K media drop.",
+                                    "Aura requires camera (QR scanning), audio (voice notes), and network permissions for real 5G internet sharing & 4K media drop.",
                                     fontSize = 12.sp,
                                     color = Color(0xFF475569)
                                 )
@@ -455,6 +472,10 @@ class MainActivity : ComponentActivity() {
                         confirmButton = {
                             Button(
                                 onClick = {
+                                    getSharedPreferences("aura_mesh_prefs", Context.MODE_PRIVATE)
+                                        .edit()
+                                        .putBoolean("has_asked_permissions", true)
+                                        .apply()
                                     multiplePermissionsLauncher.launch(requiredPermissions)
                                     showPermissionDialog = false
                                 },
@@ -464,8 +485,14 @@ class MainActivity : ComponentActivity() {
                             }
                         },
                         dismissButton = {
-                            TextButton(onClick = { showPermissionDialog = false }) {
-                                Text("Later", color = Color(0xFF64748B))
+                            TextButton(onClick = {
+                                getSharedPreferences("aura_mesh_prefs", Context.MODE_PRIVATE)
+                                    .edit()
+                                    .putBoolean("has_asked_permissions", true)
+                                    .apply()
+                                showPermissionDialog = false
+                            }) {
+                                Text("Don't ask again", color = Color(0xFF64748B))
                             }
                         },
                         shape = RoundedCornerShape(20.dp),
@@ -864,7 +891,7 @@ class MainActivity : ComponentActivity() {
                         .background(Color(0xFF059669), CircleShape)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Send,
+                        imageVector = Icons.AutoMirrored.Filled.Send,
                         contentDescription = "Send",
                         tint = Color.White
                     )
@@ -931,7 +958,7 @@ class MainActivity : ComponentActivity() {
                                 }
                                 Spacer(modifier = Modifier.height(6.dp))
                                 LinearProgressIndicator(
-                                    progress = item.progressPercent / 100f,
+                                    progress = { item.progressPercent / 100f },
                                     modifier = Modifier.fillMaxWidth(),
                                     color = Color(0xFF059669)
                                 )
@@ -1009,7 +1036,7 @@ class MainActivity : ComponentActivity() {
                         Switch(checked = isDnsLeakProtected, onCheckedChange = onDnsChange)
                     }
 
-                    Divider(modifier = Modifier.padding(vertical = 10.dp), color = Color(0xFFF1F5F9))
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = Color(0xFFF1F5F9))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1153,4 +1180,3 @@ fun AuraMeshAppTheme(content: @Composable () -> Unit) {
         content = content
     )
 }
-

@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">Aura Mesh</string>
+    <string name="app_name">Aura 5G Mesh</string>
     <string name="vpn_channel_id">aura_vpn_channel</string>
-    <string name="vpn_channel_name">Aura Mesh Tunnel Active</string>
+    <string name="vpn_channel_name">Aura 5G Mesh Tunnel Active</string>
 </resources>
