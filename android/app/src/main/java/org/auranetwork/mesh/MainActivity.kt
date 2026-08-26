@@ -65,23 +65,38 @@ data class NativeMediaItem(
     val progressPercent: Int
 )
 
+data class UiPairRequest(
+    val clientIp: String,
+    val clientPort: Int,
+    val clientName: String,
+    val otpCode: String
+)
+
 class MainActivity : ComponentActivity() {
 
-    // Clean initial states - NO FAKE PRE-FILLED DATA!
+    // Clean dynamic states
     private var targetPairCode by mutableStateOf("")
-    private var customHostIp by mutableStateOf("192.168.43.1")
+    private var customHostIp by mutableStateOf("")
     private var myHostCode by mutableStateOf("")
+    private var prevHostCode by mutableStateOf("")
+    private var otpSecondsRemaining by mutableStateOf(30)
+    
     private var isConnected by mutableStateOf(false)
+    private var isConnecting by mutableStateOf(false)
+    private var connectionStatusText by mutableStateOf<String?>(null)
     private var isHostActive by mutableStateOf(false)
     private var isHostMode by mutableStateOf(false)
+    
     private var dataServedMb by mutableStateOf(0.0)
     private var dataHostServedMb by mutableStateOf(0.0)
     private var activePeersCount by mutableStateOf(0L)
     private var currentPingMs by mutableStateOf(0)
     private var currentSpeedMbps by mutableStateOf(0.0)
     private var errorMessage by mutableStateOf<String?>(null)
+    
     private var showPermissionDialog by mutableStateOf(false)
     private var showAdvancedSettings by mutableStateOf(false)
+    private var pendingUiPairRequest by mutableStateOf<UiPairRequest?>(null)
 
     // Chat and Media States
     private val chatMessages = mutableStateListOf<NativeChatMessage>()
@@ -121,7 +136,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Multiple Permissions Launcher (Saves preference so it NEVER asks repeatedly!)
+    // Multiple Permissions Launcher (Persisted once in SharedPreferences)
     private val multiplePermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -132,11 +147,11 @@ class MainActivity : ComponentActivity() {
         showPermissionDialog = false
         val allGranted = permissions.entries.all { it.value }
         if (allGranted) {
-            Toast.makeText(this, "Permissions granted! Aura 5G Mesh ready.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "All permissions configured! Aura 5G Mesh ready.", Toast.LENGTH_SHORT).show()
         }
     }
 
-    // Real Gallery / Document Picker Launcher (Queries exact real filename and byte size)
+    // Real Gallery / Document Picker Launcher
     private val galleryPickerLauncher = registerForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris: List<Uri>? ->
@@ -168,14 +183,38 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val vpnStateReceiver = object : BroadcastReceiver() {
+    private val meshStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            val connected = intent?.getBooleanExtra(AuraVpnService.EXTRA_IS_CONNECTED, false) ?: false
-            val error = intent?.getStringExtra(AuraVpnService.EXTRA_ERROR)
-            isConnected = connected
-            if (error != null) {
-                errorMessage = error
-                Toast.makeText(this@MainActivity, error, Toast.LENGTH_LONG).show()
+            when (intent?.action) {
+                AuraVpnService.ACTION_STATE_CHANGED -> {
+                    val connected = intent.getBooleanExtra(AuraVpnService.EXTRA_IS_CONNECTED, false)
+                    val connecting = intent.getBooleanExtra(AuraVpnService.EXTRA_IS_CONNECTING, false)
+                    val statusMsg = intent.getStringExtra(AuraVpnService.EXTRA_STATUS_MSG)
+                    val error = intent.getStringExtra(AuraVpnService.EXTRA_ERROR)
+
+                    isConnected = connected
+                    isConnecting = connecting
+                    connectionStatusText = statusMsg
+                    if (error != null) {
+                        errorMessage = error
+                        Toast.makeText(this@MainActivity, error, Toast.LENGTH_LONG).show()
+                    }
+                }
+                AuraHostService.ACTION_PAIR_REQUEST_ARRIVED -> {
+                    val clientIp = intent.getStringExtra(AuraHostService.EXTRA_CLIENT_IP) ?: ""
+                    val clientPort = intent.getIntExtra(AuraHostService.EXTRA_CLIENT_PORT, 0)
+                    val clientName = intent.getStringExtra(AuraHostService.EXTRA_CLIENT_NAME) ?: "Nearby Android Device"
+                    val reqOtp = intent.getStringExtra(AuraHostService.EXTRA_HOST_OTP) ?: ""
+
+                    if (clientIp.isNotEmpty() && clientPort > 0) {
+                        pendingUiPairRequest = UiPairRequest(
+                            clientIp = clientIp,
+                            clientPort = clientPort,
+                            clientName = clientName,
+                            otpCode = reqOtp
+                        )
+                    }
+                }
             }
         }
     }
@@ -183,12 +222,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Generate persistent local 6-digit host code
-        myHostCode = (100000 + (Math.random() * 900000).toInt()).toString()
+        // Generate initial 6-digit dynamic OTP
+        generateNewHostOtp()
         isConnected = AuraVpnService.isConnectedState.get()
         isHostActive = AuraHostService.isHostRunningState.get()
 
-        // Check if permissions were already requested - if yes, do NOT ask again
+        // Check if permissions were already requested
         val prefs = getSharedPreferences("aura_mesh_prefs", Context.MODE_PRIVATE)
         val hasAskedBefore = prefs.getBoolean("has_asked_permissions", false)
         val missingPermissions = requiredPermissions.any {
@@ -198,12 +237,15 @@ class MainActivity : ComponentActivity() {
             showPermissionDialog = true
         }
 
-        // Register State Broadcast Receiver
-        val filter = IntentFilter(AuraVpnService.ACTION_STATE_CHANGED)
+        // Register State Broadcast Receivers
+        val filter = IntentFilter().apply {
+            addAction(AuraVpnService.ACTION_STATE_CHANGED)
+            addAction(AuraHostService.ACTION_PAIR_REQUEST_ARRIVED)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(vpnStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(meshStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
-            registerReceiver(vpnStateReceiver, filter)
+            registerReceiver(meshStateReceiver, filter)
         }
 
         setContent {
@@ -216,7 +258,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         try {
-            unregisterReceiver(vpnStateReceiver)
+            unregisterReceiver(meshStateReceiver)
         } catch (e: Exception) {
             // ignore
         }
@@ -225,15 +267,27 @@ class MainActivity : ComponentActivity() {
         mediaPlayer = null
     }
 
-    /**
-     * Reads actual file bytes chunk by chunk from ContentResolver and calculates real progress.
-     */
+    private fun generateNewHostOtp() {
+        prevHostCode = myHostCode
+        myHostCode = (100000 + (Math.random() * 900000).toInt()).toString()
+        otpSecondsRemaining = 30
+
+        if (isHostActive) {
+            val intent = Intent(this, AuraHostService::class.java).apply {
+                action = AuraHostService.ACTION_UPDATE_OTP
+                putExtra(AuraHostService.EXTRA_HOST_OTP, myHostCode)
+                putExtra(AuraHostService.EXTRA_PREV_OTP, prevHostCode)
+            }
+            startService(intent)
+        }
+    }
+
     private fun streamRealFileBytes(uri: Uri, item: NativeMediaItem) {
         val scope = CoroutineScope(Dispatchers.IO)
         scope.launch {
             try {
                 contentResolver.openInputStream(uri)?.use { stream ->
-                    val buffer = ByteArray(65536) // 64KB chunks
+                    val buffer = ByteArray(65536)
                     var totalRead = 0L
                     val totalSize = if (item.sizeBytes > 0) item.sizeBytes else stream.available().toLong().coerceAtLeast(1L)
                     var bytesRead: Int
@@ -251,7 +305,7 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                         }
-                        delay(20) // yield to allow smooth UI rendering
+                        delay(15)
                     }
 
                     withContext(Dispatchers.Main) {
@@ -259,7 +313,7 @@ class MainActivity : ComponentActivity() {
                         if (idx >= 0) {
                             mediaTransfers[idx] = item.copy(progressPercent = 100, isComplete = true)
                         }
-                        Toast.makeText(this@MainActivity, "File prepared and streamed: ${item.name}", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this@MainActivity, "File prepared and ready: ${item.name}", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
@@ -344,7 +398,19 @@ class MainActivity : ComponentActivity() {
         var isDnsLeakProtected by remember { mutableStateOf(true) }
         var isKillSwitchEnabled by remember { mutableStateOf(false) }
 
-        // 100% REAL LIVE TELEMETRY & SPEED ENGINE
+        // 30-Second Rotating OTP Countdown Loop
+        LaunchedEffect(isHostMode) {
+            while (true) {
+                delay(1000)
+                if (otpSecondsRemaining > 1) {
+                    otpSecondsRemaining--
+                } else {
+                    generateNewHostOtp()
+                }
+            }
+        }
+
+        // 100% Real Live Telemetry & Speed Engine
         LaunchedEffect(isConnected, isHostActive) {
             var prevBytes = 0L
             var prevTime = System.currentTimeMillis()
@@ -368,7 +434,6 @@ class MainActivity : ComponentActivity() {
                     activePeersCount = 0L
                 }
 
-                // Real Speed Calculation: (deltaBytes * 8) / (deltaTimeSec * 1_000_000)
                 val deltaBytes = (currentTotalBytes - prevBytes).coerceAtLeast(0L)
                 val deltaTimeSec = (now - prevTime) / 1000.0
                 if (deltaTimeSec > 0 && (isConnected || isHostActive)) {
@@ -380,7 +445,6 @@ class MainActivity : ComponentActivity() {
                 prevBytes = currentTotalBytes
                 prevTime = now
 
-                // Real Ping Measurement to active host or DNS server
                 if (isConnected) {
                     withContext(Dispatchers.IO) {
                         try {
@@ -445,7 +509,7 @@ class MainActivity : ComponentActivity() {
                     actions = {
                         Surface(
                             shape = CircleShape,
-                            color = if (isConnected || isHostActive) Color(0xFFECFDF5) else Color(0xFFF1F5F9),
+                            color = if (isConnected || isHostActive) Color(0xFFECFDF5) else if (isConnecting) Color(0xFFFEF3C7) else Color(0xFFF1F5F9),
                             modifier = Modifier.padding(end = 12.dp)
                         ) {
                             Row(
@@ -456,17 +520,17 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier
                                         .size(8.dp)
                                         .background(
-                                            if (isConnected || isHostActive) Color(0xFF10B981) else Color(0xFF94A3B8),
+                                            if (isConnected || isHostActive) Color(0xFF10B981) else if (isConnecting) Color(0xFFF59E0B) else Color(0xFF94A3B8),
                                             CircleShape
                                         )
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = if (isConnected) "VPN ACTIVE" else if (isHostActive) "HOSTING 5G" else "IDLE",
+                                    text = if (isConnected) "VPN ACTIVE" else if (isConnecting) "PAIRING..." else if (isHostActive) "HOSTING 5G" else "IDLE",
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
                                     fontFamily = FontFamily.Monospace,
-                                    color = if (isConnected || isHostActive) Color(0xFF047857) else Color(0xFF64748B)
+                                    color = if (isConnected || isHostActive) Color(0xFF047857) else if (isConnecting) Color(0xFFB45309) else Color(0xFF64748B)
                                 )
                             }
                         }
@@ -541,6 +605,90 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Text(errorMessage ?: "", color = Color.White, fontSize = 12.sp)
                     }
+                }
+
+                // HOST CONSENT & APPROVAL POPUP DIALOG (Appears on Phone A when Phone B requests connection)
+                pendingUiPairRequest?.let { req ->
+                    AlertDialog(
+                        onDismissRequest = { /* Force explicit user action */ },
+                        icon = {
+                            Icon(
+                                imageVector = Icons.Default.VpnKey,
+                                contentDescription = null,
+                                tint = Color(0xFF059669),
+                                modifier = Modifier.size(36.dp)
+                            )
+                        },
+                        title = {
+                            Text(
+                                text = "Incoming 5G Share Request",
+                                fontWeight = FontWeight.ExtraBold,
+                                fontSize = 18.sp,
+                                textAlign = TextAlign.Center
+                            )
+                        },
+                        text = {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = "A nearby device wants to connect and share your 5G internet.",
+                                    fontSize = 13.sp,
+                                    color = Color(0xFF475569)
+                                )
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9)),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Text("Device: ${req.clientName}", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF0F172A))
+                                        Text("IP: ${req.clientIp}", fontSize = 11.sp, color = Color(0xFF64748B), fontFamily = FontFamily.Monospace)
+                                        Text("Entered OTP: #${req.otpCode}", fontWeight = FontWeight.ExtraBold, fontSize = 14.sp, color = Color(0xFF059669), fontFamily = FontFamily.Monospace)
+                                    }
+                                }
+                            }
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = {
+                                    val intent = Intent(this@MainActivity, AuraHostService::class.java).apply {
+                                        action = AuraHostService.ACTION_APPROVE_PEER
+                                        putExtra(AuraHostService.EXTRA_CLIENT_IP, req.clientIp)
+                                        putExtra(AuraHostService.EXTRA_CLIENT_PORT, req.clientPort)
+                                    }
+                                    startService(intent)
+                                    pendingUiPairRequest = null
+                                    Toast.makeText(this@MainActivity, "Peer Approved! Sharing 5G internet.", Toast.LENGTH_SHORT).show()
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669)),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Approve & Share 5G", fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(
+                                onClick = {
+                                    val intent = Intent(this@MainActivity, AuraHostService::class.java).apply {
+                                        action = AuraHostService.ACTION_REJECT_PEER
+                                        putExtra(AuraHostService.EXTRA_CLIENT_IP, req.clientIp)
+                                        putExtra(AuraHostService.EXTRA_CLIENT_PORT, req.clientPort)
+                                    }
+                                    startService(intent)
+                                    pendingUiPairRequest = null
+                                    Toast.makeText(this@MainActivity, "Connection Rejected.", Toast.LENGTH_SHORT).show()
+                                }
+                            ) {
+                                Text("Reject", color = Color(0xFFEF4444), fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        shape = RoundedCornerShape(20.dp),
+                        containerColor = Color.White
+                    )
                 }
 
                 // Permission Onboarding Dialog - Shown ONLY ONCE!
@@ -696,11 +844,12 @@ class MainActivity : ComponentActivity() {
                     if (!isHostMode) {
                         // CONSUMER MODE (PHONE B)
                         Text(
-                            text = if (isConnected) "● 100% OS TRAFFIC ROUTED VIA PEER" else "○ TUNNEL DISCONNECTED",
+                            text = if (isConnected) "● 100% OS TRAFFIC ROUTED VIA PEER" else if (isConnecting) "⏳ ${connectionStatusText ?: "PAIRING WITH HOST..."}" else "○ TUNNEL DISCONNECTED",
                             fontWeight = FontWeight.ExtraBold,
                             fontSize = 11.sp,
-                            color = if (isConnected) Color(0xFF059669) else Color(0xFF94A3B8),
-                            fontFamily = FontFamily.Monospace
+                            color = if (isConnected) Color(0xFF059669) else if (isConnecting) Color(0xFFF59E0B) else Color(0xFF94A3B8),
+                            fontFamily = FontFamily.Monospace,
+                            textAlign = TextAlign.Center
                         )
 
                         Spacer(modifier = Modifier.height(16.dp))
@@ -722,8 +871,8 @@ class MainActivity : ComponentActivity() {
                             OutlinedTextField(
                                 value = targetPairCode,
                                 onValueChange = { if (it.length <= 6) targetPairCode = it },
-                                label = { Text("Enter Host's 6-Digit Code") },
-                                placeholder = { Text("e.g. from Phone A's screen") },
+                                label = { Text("Enter Host's 6-Digit OTP Code") },
+                                placeholder = { Text("e.g. from Host's Screen") },
                                 singleLine = true,
                                 textStyle = LocalTextStyle.current.copy(
                                     textAlign = TextAlign.Center,
@@ -740,8 +889,8 @@ class MainActivity : ComponentActivity() {
                                 OutlinedTextField(
                                     value = customHostIp,
                                     onValueChange = { customHostIp = it },
-                                    label = { Text("Host IP / Gateway") },
-                                    placeholder = { Text("192.168.43.1") },
+                                    label = { Text("Specific Host IP (Optional)") },
+                                    placeholder = { Text("Leave blank for Auto-Broadcast") },
                                     singleLine = true,
                                     modifier = Modifier.fillMaxWidth(),
                                     shape = RoundedCornerShape(12.dp)
@@ -753,32 +902,38 @@ class MainActivity : ComponentActivity() {
 
                         Button(
                             onClick = {
-                                if (isConnected) stopAuraVpn() else prepareAndStartVpn()
+                                if (isConnected || isConnecting) stopAuraVpn() else prepareAndStartVpn()
                             },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(52.dp),
                             shape = RoundedCornerShape(16.dp),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isConnected) Color(0xFFEF4444) else Color(0xFF059669)
+                                containerColor = if (isConnected || isConnecting) Color(0xFFEF4444) else Color(0xFF059669)
                             )
                         ) {
-                            Icon(
-                                imageVector = if (isConnected) Icons.Default.Close else Icons.Default.PowerSettingsNew,
-                                contentDescription = "Toggle",
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = if (isConnected) "Disconnect 5G Tunnel" else "Connect to 5G Hotspot",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 14.sp
-                            )
+                            if (isConnecting) {
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Waiting for Host Approval...", fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(
+                                    imageVector = if (isConnected) Icons.Default.Close else Icons.Default.PowerSettingsNew,
+                                    contentDescription = "Toggle",
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = if (isConnected) "Disconnect 5G Tunnel" else "Connect to 5G Hotspot",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp
+                                )
+                            }
                         }
                     } else {
                         // HOST MODE (PHONE A)
                         Text(
-                            text = if (isHostActive) "● 5G RELAY SERVER ACTIVE" else "○ RELAY SERVER OFFLINE",
+                            text = if (isHostActive) "● 5G RELAY ACTIVE (OTP ROTATING)" else "○ RELAY SERVER OFFLINE",
                             fontWeight = FontWeight.Bold,
                             fontSize = 11.sp,
                             color = if (isHostActive) Color(0xFF4F46E5) else Color(0xFF94A3B8),
@@ -794,33 +949,50 @@ class MainActivity : ComponentActivity() {
                                 .fillMaxWidth()
                                 .clickable {
                                     clipboardManager.setText(AnnotatedString(myHostCode))
-                                    Toast.makeText(this@MainActivity, "Host code copied to clipboard!", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(this@MainActivity, "Host OTP copied to clipboard!", Toast.LENGTH_SHORT).show()
                                 }
                         ) {
                             Column(
                                 modifier = Modifier.padding(16.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
-                                Text(
-                                    text = myHostCode,
-                                    fontSize = 34.sp,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    color = Color(0xFF4338CA),
-                                    fontFamily = FontFamily.Monospace,
-                                    letterSpacing = 5.sp
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    Text(
+                                        text = myHostCode,
+                                        fontSize = 34.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        color = Color(0xFF4338CA),
+                                        fontFamily = FontFamily.Monospace,
+                                        letterSpacing = 5.sp
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    IconButton(
+                                        onClick = { generateNewHostOtp() },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(Icons.Default.Refresh, contentDescription = "Refresh OTP", tint = Color(0xFF6366F1))
+                                    }
+                                }
+
                                 Spacer(modifier = Modifier.height(4.dp))
-                                Row(verticalAlignment = Alignment.CenterVertically) {
+
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
                                     Icon(
-                                        imageVector = Icons.Default.ContentCopy,
-                                        contentDescription = "Copy",
+                                        imageVector = Icons.Default.Timer,
+                                        contentDescription = "Timer",
                                         tint = Color(0xFF6366F1),
-                                        modifier = Modifier.size(14.dp)
+                                        modifier = Modifier.size(13.dp)
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(
-                                        text = "Tap to Copy Host Code",
-                                        fontSize = 10.sp,
+                                        text = "Expires in ${otpSecondsRemaining}s • Tap to Copy",
+                                        fontSize = 11.sp,
                                         color = Color(0xFF6366F1),
                                         fontWeight = FontWeight.SemiBold
                                     )
@@ -888,7 +1060,7 @@ class MainActivity : ComponentActivity() {
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "AES-256-GCM / User-Space NAT",
+                            text = "30s Dynamic OTP / Auto LAN Discovery",
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color(0xFF334155),
@@ -1244,11 +1416,18 @@ class MainActivity : ComponentActivity() {
             Spacer(modifier = Modifier.height(14.dp))
 
             Text(
-                text = "Pair Code: $myHostCode",
+                text = "Dynamic OTP: $myHostCode",
                 fontSize = 18.sp,
                 fontWeight = FontWeight.ExtraBold,
                 fontFamily = FontFamily.Monospace,
                 color = Color(0xFF0F172A)
+            )
+
+            Text(
+                text = "Expires in ${otpSecondsRemaining}s",
+                fontSize = 11.sp,
+                color = Color(0xFF6366F1),
+                fontWeight = FontWeight.SemiBold
             )
 
             Spacer(modifier = Modifier.height(8.dp))
@@ -1271,7 +1450,8 @@ class MainActivity : ComponentActivity() {
     private fun startHostService() {
         val intent = Intent(this, AuraHostService::class.java).apply {
             action = AuraHostService.ACTION_START_HOST
-            putExtra(AuraHostService.EXTRA_HOST_CODE, myHostCode)
+            putExtra(AuraHostService.EXTRA_HOST_OTP, myHostCode)
+            putExtra(AuraHostService.EXTRA_PREV_OTP, prevHostCode)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
@@ -1294,7 +1474,7 @@ class MainActivity : ComponentActivity() {
     private fun prepareAndStartVpn() {
         val target = targetPairCode.trim()
         if (target.length < 5) {
-            Toast.makeText(this, "Please enter a valid 6-digit pair code from host", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Please enter the 6-digit Host OTP from Phone A's screen", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -1310,7 +1490,7 @@ class MainActivity : ComponentActivity() {
     private fun startAuraVpn() {
         val intent = Intent(this, AuraVpnService::class.java).apply {
             action = AuraVpnService.ACTION_CONNECT
-            putExtra(AuraVpnService.EXTRA_PAIR_CODE, targetPairCode)
+            putExtra(AuraVpnService.EXTRA_PAIR_CODE, targetPairCode.trim())
             putExtra(AuraVpnService.EXTRA_HOST_IP, customHostIp.trim())
             putExtra(AuraVpnService.EXTRA_HOST_PORT, 9000)
         }
@@ -1319,7 +1499,7 @@ class MainActivity : ComponentActivity() {
         } else {
             startService(intent)
         }
-        isConnected = true
+        isConnecting = true
     }
 
     private fun stopAuraVpn() {
@@ -1328,6 +1508,7 @@ class MainActivity : ComponentActivity() {
         }
         startService(intent)
         isConnected = false
+        isConnecting = false
     }
 }
 
