@@ -1,0 +1,10 @@
+{
+  "name": "aura-blockchain",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix explorer run dev",
+    "build": "npm --prefix explorer run build",
+    "start": "npm --prefix explorer run start"
+  }
+}
