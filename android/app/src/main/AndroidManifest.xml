@@ -69,6 +69,15 @@
                 android:value="P2P Mesh Encrypted VPN Hotspot Tunneling" />
         </service>
 
+        <service
+            android:name=".AuraHostService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="P2P Mesh 5G Internet Sharing Exit Node" />
+        </service>
+
     </application>
 
 </manifest>
